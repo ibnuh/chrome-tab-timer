@@ -306,6 +306,7 @@ async function restoreTabTitle(tabId) {
   } catch {}
 }
 
+
 async function ensureBadgeAlarm() {
   const existing = await chrome.alarms.get(BADGE_ALARM);
   if (!existing) {
@@ -584,6 +585,13 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.url) {
     await checkUrlRules(tabId, changeInfo.url);
+  }
+  // Re-inject tab title after page load (survives reload/navigation)
+  if (changeInfo.status === 'complete') {
+    const timer = await getTimer(tabId);
+    if (timer) {
+      await updateTabTitle(tabId);
+    }
   }
 });
 
