@@ -1,0 +1,14 @@
+{
+  "name": "chrome-tab-timer",
+  "version": "1.0.0",
+  "description": "Lightweight Chrome extension for per-tab timers with configurable completion actions",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "dev": "node build.js --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "sharp": "^0.34.5"
+  }
+}

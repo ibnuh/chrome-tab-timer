@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="options.css">
+  <title>Tab Timer Settings</title>
+</head>
+<body>
+  <div class="container">
+    <h1>Tab Timer Settings</h1>
+
+    <!-- General -->
+    <div class="card">
+      <h2>General</h2>
+      <div class="field">
+        <div class="field-info">
+          <label>Play sound on completion</label>
+          <span class="field-desc">Play a chime when a timer finishes</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-sound" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="field">
+        <div class="field-info">
+          <label>Show notification</label>
+          <span class="field-desc">Display a desktop notification when a timer completes</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-notification" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="field">
+        <div class="field-info">
+          <label>Show countdown in tab title</label>
+          <span class="field-desc">Prepend remaining time to the browser tab title</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-tabtitle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="field">
+        <div class="field-info">
+          <label>Theme</label>
+          <span class="field-desc">Choose light, dark, or follow your system setting</span>
+        </div>
+        <div class="select-wrap">
+          <select id="opt-theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-info">
+          <label>Default action</label>
+          <span class="field-desc">Pre-selected action when opening the popup</span>
+        </div>
+        <div class="select-wrap">
+          <select id="opt-default-action">
+            <option value="alert">Alert</option>
+            <option value="close">Close tab</option>
+            <option value="reload">Reload tab</option>
+            <option value="mute">Mute tab</option>
+            <option value="focus">Focus tab</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-info">
+          <label>Alert when tab closed</label>
+          <span class="field-desc">Show a notification when a tab with an active timer is closed</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="opt-alert-tab-close">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="field">
+        <div class="field-info">
+          <label>Snooze duration</label>
+          <span class="field-desc">Minutes to snooze when clicking the snooze button</span>
+        </div>
+        <div class="inline-input">
+          <input type="number" id="opt-snooze" min="1" max="60" value="5"> min
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="card">
+      <h2>Available Actions</h2>
+      <p class="card-desc">Choose which actions appear in the dropdown. At least one must be enabled.</p>
+      <div class="action-list" id="action-list">
+        <label class="action-item"><input type="checkbox" value="alert" checked><span class="action-name">Alert</span><span class="action-desc">Show a notification</span></label>
+        <label class="action-item"><input type="checkbox" value="close" checked><span class="action-name">Close tab</span><span class="action-desc">Close the tab when timer ends</span></label>
+        <label class="action-item"><input type="checkbox" value="reload" checked><span class="action-name">Reload tab</span><span class="action-desc">Refresh the tab when timer ends</span></label>
+        <label class="action-item"><input type="checkbox" value="mute" checked><span class="action-name">Mute tab</span><span class="action-desc">Mute the tab's audio</span></label>
+        <label class="action-item"><input type="checkbox" value="focus" checked><span class="action-name">Focus tab</span><span class="action-desc">Bring the tab to front</span></label>
+      </div>
+    </div>
+
+    <!-- Presets -->
+    <div class="card">
+      <h2>Quick Presets</h2>
+      <p class="card-desc">Customize the preset duration buttons. Enter values in seconds.</p>
+      <div class="presets-editor" id="presets-editor"></div>
+      <button class="btn btn-secondary" id="add-preset-btn">+ Add Preset</button>
+    </div>
+
+    <!-- URL Auto-Timers -->
+    <div class="card">
+      <h2>URL Auto-Timers</h2>
+      <p class="card-desc">Automatically start a timer when visiting URLs matching a pattern (regex).</p>
+      <div id="url-rules-editor"></div>
+      <button class="btn btn-secondary" id="add-url-rule-btn">+ Add Rule</button>
+    </div>
+
+    <!-- Export/Import -->
+    <div class="card">
+      <h2>Data</h2>
+      <p class="card-desc">Export or import your settings, templates, and URL rules.</p>
+      <div class="btn-group">
+        <button class="btn btn-secondary" id="export-btn">Export Settings</button>
+        <button class="btn btn-secondary" id="import-btn">Import Settings</button>
+        <input type="file" id="import-file" accept=".json" style="display:none">
+      </div>
+    </div>
+
+    <!-- Save -->
+    <div class="save-bar">
+      <span class="save-status" id="save-status"></span>
+      <button class="btn btn-primary" id="save-btn">Save Settings</button>
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

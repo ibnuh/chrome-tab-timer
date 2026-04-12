@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Header -->
+  <div class="header">
+    <div class="header-title">Tab Timer</div>
+    <div class="header-actions">
+      <button class="header-btn" id="open-settings" title="Settings">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M6.5 1.5L6.1 3.1C5.7 3.3 5.3 3.5 5 3.8L3.4 3.2L1.9 5.8L3.2 6.9C3.2 7.3 3.2 7.7 3.2 8.1L1.9 9.2L3.4 11.8L5 11.2C5.3 11.5 5.7 11.7 6.1 11.9L6.5 13.5H9.5L9.9 11.9C10.3 11.7 10.7 11.5 11 11.2L12.6 11.8L14.1 9.2L12.8 8.1C12.8 7.7 12.8 7.3 12.8 6.9L14.1 5.8L12.6 3.2L11 3.8C10.7 3.5 10.3 3.3 9.9 3.1L9.5 1.5H6.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+          <circle cx="8" cy="7.5" r="2" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Current tab timer -->
+  <div class="section" id="current-section">
+    <div id="current-timer-area">
+      <div class="no-timer">No timer on this tab</div>
+    </div>
+  </div>
+
+  <!-- Set timer -->
+  <div class="section section-set">
+    <!-- Templates quick bar -->
+    <div id="templates-bar" style="display:none">
+      <div class="section-label-row" style="margin-bottom:6px">
+        <h3 class="section-label">Templates</h3>
+      </div>
+      <div class="templates-list" id="templates-list"></div>
+    </div>
+
+    <div class="presets" id="presets"></div>
+    <div class="custom-row">
+      <div class="input-group">
+        <input type="number" class="time-input" id="input-min" min="0" max="999" placeholder="0" value="">
+        <label class="input-label" for="input-min">min</label>
+      </div>
+      <span class="time-colon">:</span>
+      <div class="input-group">
+        <input type="number" class="time-input" id="input-sec" min="0" max="59" placeholder="0" value="">
+        <label class="input-label" for="input-sec">sec</label>
+      </div>
+    </div>
+    <div class="options-row">
+      <div class="select-wrap">
+        <select id="action-select"></select>
+      </div>
+      <input type="text" class="label-input" id="label-input" placeholder="Label (optional)" maxlength="50">
+    </div>
+    <div class="btn-row">
+      <button class="btn-start" id="start-btn" disabled>Start Timer</button>
+      <button class="btn-icon" id="save-template-btn" title="Save as template">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M11 1H3a1 1 0 00-1 1v10a1 1 0 001 1h8a1 1 0 001-1V3.5L9.5 1z" stroke="currentColor" stroke-width="1.2"/><path d="M5 1v3h4V1M4 8h6M4 10.5h4" stroke="currentColor" stroke-width="1.1"/></svg>
+      </button>
+    </div>
+    <!-- Tab group option -->
+    <div id="group-option" class="group-option" style="display:none">
+      <label><input type="checkbox" id="apply-to-group"> Apply to all tabs in this group</label>
+    </div>
+  </div>
+
+  <div class="scroll-area">
+    <!-- All active timers -->
+    <div class="section section-collapsible" id="active-section" style="display:none">
+      <div class="section-label-row">
+        <h3 class="section-label">Active Timers</h3>
+        <button class="clear-btn" id="cancel-all-btn">Cancel All</button>
+      </div>
+      <ul class="timer-list" id="timer-list"></ul>
+    </div>
+
+    <!-- History -->
+    <div class="section section-collapsible" id="history-section" style="display:none">
+      <div class="section-label-row">
+        <h3 class="section-label">History</h3>
+        <div>
+          <button class="clear-btn" id="stats-btn">Stats</button>
+          <button class="clear-btn" id="clear-history-btn">Clear</button>
+        </div>
+      </div>
+      <ul class="timer-list" id="history-list"></ul>
+    </div>
+
+    <!-- Stats (hidden by default) -->
+    <div class="section section-collapsible" id="stats-section" style="display:none">
+      <div class="section-label-row">
+        <h3 class="section-label">Stats</h3>
+        <button class="clear-btn" id="close-stats-btn">Close</button>
+      </div>
+      <div id="stats-content"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

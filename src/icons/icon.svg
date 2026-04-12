@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- White fill for dark backgrounds -->
+  <circle cx="64" cy="70" r="54" fill="#ffffff"/>
+
+  <!-- Clock body -->
+  <circle cx="64" cy="70" r="54" fill="none" stroke="#2563eb" stroke-width="8"/>
+
+  <!-- Top button -->
+  <rect x="56" y="6" width="16" height="14" rx="4" fill="#2563eb"/>
+
+  <!-- Button stem -->
+  <line x1="64" y1="16" x2="64" y2="20" stroke="#2563eb" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Left leg -->
+  <line x1="26" y1="28" x2="18" y2="18" stroke="#2563eb" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- Right leg -->
+  <line x1="102" y1="28" x2="110" y2="18" stroke="#2563eb" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- Hour markers -->
+  <line x1="64" y1="24" x2="64" y2="32" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+  <line x1="64" y1="108" x2="64" y2="116" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+  <line x1="18" y1="70" x2="26" y2="70" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+  <line x1="102" y1="70" x2="110" y2="70" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Minor markers -->
+  <line x1="37" y1="35" x2="41" y2="39" stroke="#93c5fd" stroke-width="3" stroke-linecap="round"/>
+  <line x1="91" y1="35" x2="87" y2="39" stroke="#93c5fd" stroke-width="3" stroke-linecap="round"/>
+  <line x1="37" y1="105" x2="41" y2="101" stroke="#93c5fd" stroke-width="3" stroke-linecap="round"/>
+  <line x1="91" y1="105" x2="87" y2="101" stroke="#93c5fd" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Minute hand -->
+  <line x1="64" y1="70" x2="84" y2="48" stroke="#2563eb" stroke-width="5" stroke-linecap="round"/>
+
+  <!-- Hour hand -->
+  <line x1="64" y1="70" x2="50" y2="50" stroke="#1e1b4b" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Center dot -->
+  <circle cx="64" cy="70" r="5" fill="#2563eb"/>
+</svg>
