@@ -1,16 +1,13 @@
-const SETTINGS_KEY = 'settings';
-
-const DEFAULTS = {
-  sound: true,
-  notification: true,
-  tabTitle: true,
-  theme: 'system',
-  defaultAction: 'alert',
-  enabledActions: ['alert', 'close', 'reload', 'mute', 'focus'],
-  presets: [30, 60, 300, 600, 900, 1800],
-  snoozeMinutes: 5,
-  alertOnTabClose: false,
-};
+import {
+  ACTION_LABELS,
+  ACTIONS,
+  MAX_PATTERN_LENGTH,
+  SETTINGS_KEY,
+  formatPresetLabel,
+  isValidPattern,
+  normalizeSettings,
+  normalizeUrlRules,
+} from './lib.js';
 
 let settings = {};
 let urlRules = [];
@@ -22,9 +19,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(settings.theme);
   renderSettings();
 
-  // Load URL rules
   const resp = await chrome.runtime.sendMessage({ type: 'GET_URL_RULES' });
-  urlRules = resp.rules || [];
+  urlRules = normalizeUrlRules(resp.rules);
   renderUrlRules();
 
   document.getElementById('save-btn').addEventListener('click', saveSettings);
@@ -37,16 +33,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 function applyTheme(theme) {
-  let resolved = theme;
-  if (theme === 'system') {
-    resolved = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  }
+  const resolved =
+    theme === 'system'
+      ? window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light'
+      : theme;
   document.documentElement.setAttribute('data-theme', resolved);
 }
 
 async function loadSettings() {
   const result = await chrome.storage.local.get(SETTINGS_KEY);
-  return { ...DEFAULTS, ...result[SETTINGS_KEY] };
+  return normalizeSettings(result[SETTINGS_KEY]);
 }
 
 function renderSettings() {
@@ -86,7 +84,7 @@ function renderPresets() {
 
     input.addEventListener('input', () => {
       settings.presets[i] = parseInt(input.value, 10) || 0;
-      label.textContent = formatPresetLabel(parseInt(input.value, 10) || 0);
+      label.textContent = formatPresetLabel(settings.presets[i]);
     });
 
     const remove = document.createElement('button');
@@ -107,21 +105,6 @@ function addPreset() {
   renderPresets();
 }
 
-function formatPresetLabel(secs) {
-  if (!secs || secs <= 0) return '-';
-  if (secs >= 3600) {
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    return m > 0 ? `= ${h}h ${m}m` : `= ${h}h`;
-  }
-  if (secs >= 60) {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return s > 0 ? `= ${m}m ${s}s` : `= ${m}m`;
-  }
-  return `= ${secs}s`;
-}
-
 // --- URL Rules ---
 
 function renderUrlRules() {
@@ -136,31 +119,63 @@ function renderUrlRules() {
     pattern.type = 'text';
     pattern.placeholder = 'URL pattern (regex)';
     pattern.value = rule.pattern || '';
-    pattern.addEventListener('input', () => { urlRules[i].pattern = pattern.value; });
+
+    const error = document.createElement('span');
+    error.className = 'rule-error';
+    error.hidden = true;
+
+    // Validated live so a broken pattern is caught before saving, not on the
+    // next navigation where it would throw inside the worker.
+    const validate = () => {
+      if (!pattern.value) {
+        error.hidden = true;
+        row.classList.remove('invalid');
+        return;
+      }
+      const valid = isValidPattern(pattern.value);
+      row.classList.toggle('invalid', !valid);
+      error.hidden = valid;
+      error.textContent = valid
+        ? ''
+        : pattern.value.length > MAX_PATTERN_LENGTH
+          ? `Pattern is longer than ${MAX_PATTERN_LENGTH} characters`
+          : 'Not a valid regular expression';
+    };
+
+    pattern.addEventListener('input', () => {
+      urlRules[i].pattern = pattern.value;
+      validate();
+    });
 
     const duration = document.createElement('input');
     duration.type = 'number';
     duration.min = '1';
     duration.placeholder = 'sec';
     duration.value = rule.duration || 300;
-    duration.addEventListener('input', () => { urlRules[i].duration = parseInt(duration.value, 10) || 300; });
+    duration.addEventListener('input', () => {
+      urlRules[i].duration = parseInt(duration.value, 10) || 300;
+    });
 
     const action = document.createElement('select');
-    for (const [val, text] of Object.entries({ alert: 'Alert', close: 'Close', reload: 'Reload', mute: 'Mute', focus: 'Focus' })) {
+    for (const value of ACTIONS) {
       const opt = document.createElement('option');
-      opt.value = val;
-      opt.textContent = text;
+      opt.value = value;
+      opt.textContent = ACTION_LABELS[value];
       action.appendChild(opt);
     }
     action.value = rule.action || 'alert';
-    action.addEventListener('change', () => { urlRules[i].action = action.value; });
+    action.addEventListener('change', () => {
+      urlRules[i].action = action.value;
+    });
 
     const toggle = document.createElement('label');
     toggle.className = 'toggle';
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.checked = rule.enabled !== false;
-    cb.addEventListener('change', () => { urlRules[i].enabled = cb.checked; });
+    cb.addEventListener('change', () => {
+      urlRules[i].enabled = cb.checked;
+    });
     const slider = document.createElement('span');
     slider.className = 'toggle-slider';
     toggle.append(cb, slider);
@@ -173,8 +188,9 @@ function renderUrlRules() {
       renderUrlRules();
     });
 
-    row.append(pattern, duration, action, toggle, remove);
+    row.append(pattern, duration, action, toggle, remove, error);
     editor.appendChild(row);
+    validate();
   });
 }
 
@@ -196,7 +212,9 @@ async function saveSettings() {
 
   const checked = [];
   document.querySelectorAll('#action-list input[type="checkbox"]').forEach((cb) => {
-    if (cb.checked) checked.push(cb.value);
+    if (cb.checked) {
+      checked.push(cb.value);
+    }
   });
   if (checked.length === 0) {
     checked.push('alert');
@@ -204,18 +222,43 @@ async function saveSettings() {
   }
   settings.enabledActions = checked;
 
-  settings.presets = [...new Set(settings.presets.filter((v) => v > 0))].sort((a, b) => a - b);
+  // A rule with no pattern is an unfinished row and is simply dropped; a rule
+  // with an unparseable pattern is refused, because saving it would leave a rule
+  // that throws on every matching navigation.
+  const blank = urlRules.filter((rule) => !rule.pattern || !rule.pattern.trim());
+  const invalid = urlRules.filter((rule) => rule.pattern?.trim() && !isValidPattern(rule.pattern));
+  if (invalid.length > 0) {
+    showStatus(
+      invalid.length === 1
+        ? 'Fix the invalid URL pattern before saving'
+        : `Fix ${invalid.length} invalid URL patterns before saving`,
+      true
+    );
+    document.querySelector('.url-rule.invalid input[type="text"]')?.focus();
+    return;
+  }
 
-  await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+  const normalized = normalizeSettings(settings);
+  settings = normalized;
+  urlRules = normalizeUrlRules(urlRules.filter((rule) => !blank.includes(rule)));
+
+  await chrome.storage.local.set({ [SETTINGS_KEY]: normalized });
   await chrome.runtime.sendMessage({ type: 'SAVE_URL_RULES', rules: urlRules });
 
+  renderSettings();
+  renderUrlRules();
   showStatus('Settings saved');
 }
 
-function showStatus(text) {
+function showStatus(text, isError = false) {
   const status = document.getElementById('save-status');
   status.textContent = text;
-  setTimeout(() => { status.textContent = ''; }, 2000);
+  status.classList.toggle('error', isError);
+  clearTimeout(showStatus.timer);
+  showStatus.timer = setTimeout(() => {
+    status.textContent = '';
+    status.classList.remove('error');
+  }, isError ? 4000 : 2000);
 }
 
 // --- Export/Import ---
@@ -234,24 +277,31 @@ async function exportData() {
 
 async function importData(e) {
   const file = e.target.files[0];
-  if (!file) return;
+  if (!file) {
+    return;
+  }
 
   try {
-    const text = await file.text();
-    const data = JSON.parse(text);
-    await chrome.runtime.sendMessage({ type: 'IMPORT_DATA', data });
+    const data = JSON.parse(await file.text());
+    const result = await chrome.runtime.sendMessage({ type: 'IMPORT_DATA', data });
+    if (result?.error) {
+      showStatus(`Import failed: ${result.error}`, true);
+      return;
+    }
 
-    // Reload
     settings = await loadSettings();
     const resp = await chrome.runtime.sendMessage({ type: 'GET_URL_RULES' });
-    urlRules = resp.rules || [];
+    urlRules = normalizeUrlRules(resp.rules);
     renderSettings();
     renderUrlRules();
     applyTheme(settings.theme);
-    showStatus('Imported successfully');
-  } catch (err) {
-    showStatus('Import failed: invalid file');
-  }
 
-  e.target.value = '';
+    const dropped = result?.dropped || {};
+    const skipped = (dropped.templates || 0) + (dropped.urlRules || 0);
+    showStatus(skipped > 0 ? `Imported, skipped ${skipped} unusable entr${skipped === 1 ? 'y' : 'ies'}` : 'Imported successfully');
+  } catch {
+    showStatus('Import failed: invalid file', true);
+  } finally {
+    e.target.value = '';
+  }
 }
