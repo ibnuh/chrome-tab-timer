@@ -1,21 +1,19 @@
-const sharp = require('sharp');
-const path = require('path');
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const SVG_PATH = path.join(__dirname, 'src', 'icons', 'icon.svg');
-const OUT_DIR = path.join(__dirname, 'src', 'icons');
+import sharp from 'sharp';
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const SVG_PATH = path.join(ROOT, 'src', 'icons', 'icon.svg');
+const OUT_DIR = path.join(ROOT, 'src', 'icons');
+const SIZES = [16, 48, 128];
 
 async function main() {
-  for (const size of [16, 48, 128]) {
+  for (const size of SIZES) {
     const outPath = path.join(OUT_DIR, `icon${size}.png`);
-    await sharp(SVG_PATH)
-      .resize(size, size)
-      .png()
-      .toFile(outPath);
-
-    const { size: bytes } = await sharp(outPath).metadata().then(() =>
-      require('fs').promises.stat(outPath)
-    );
-    console.log(`Generated icon${size}.png (${bytes} bytes)`);
+    await sharp(SVG_PATH).resize(size, size).png().toFile(outPath);
+    console.log(`Generated icon${size}.png (${fs.statSync(outPath).size} bytes)`);
   }
 }
 

@@ -1,91 +1,100 @@
-const esbuild = require('esbuild');
-const fs = require('fs');
-const path = require('path');
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const DIST = path.join(__dirname, 'dist');
-const SRC = path.join(__dirname, 'src');
+import esbuild from 'esbuild';
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const DIST = path.join(ROOT, 'dist');
+const SRC = path.join(ROOT, 'src');
 const watchMode = process.argv.includes('--watch');
 
+const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+
 function clean() {
-  if (fs.existsSync(DIST)) {
-    fs.rmSync(DIST, { recursive: true });
-  }
-  fs.mkdirSync(DIST, { recursive: true });
+  fs.rmSync(DIST, { recursive: true, force: true });
   fs.mkdirSync(path.join(DIST, 'icons'), { recursive: true });
 }
 
-function copyManifest() {
-  fs.copyFileSync(
-    path.join(__dirname, 'manifest.json'),
-    path.join(DIST, 'manifest.json')
-  );
+/**
+ * Copies the manifest, stamping in the version from package.json so the two
+ * cannot drift apart.
+ */
+function buildManifest() {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
+  manifest.version = pkg.version;
+  fs.writeFileSync(path.join(DIST, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 }
 
 function copyIcons() {
   const iconsDir = path.join(SRC, 'icons');
-  if (!fs.existsSync(iconsDir)) return;
+  if (!fs.existsSync(iconsDir)) {
+    return;
+  }
+  // PNGs only: icon.svg is the source the PNGs are generated from, and the
+  // manifest references nothing but the PNGs.
   for (const file of fs.readdirSync(iconsDir)) {
-    fs.copyFileSync(
-      path.join(iconsDir, file),
-      path.join(DIST, 'icons', file)
-    );
+    if (!file.endsWith('.png')) {
+      continue;
+    }
+    fs.copyFileSync(path.join(iconsDir, file), path.join(DIST, 'icons', file));
   }
 }
 
-function buildHtmlWithInlineCSS(htmlFile, cssFile) {
-  let html = fs.readFileSync(path.join(SRC, htmlFile), 'utf8');
-  const css = fs.readFileSync(path.join(SRC, cssFile), 'utf8');
-
-  html = html.replace(
-    /<link\s+rel="stylesheet"\s+href="[^"]+"\s*\/?>/,
-    `<style>${css}</style>`
-  );
-
-  html = html
-    .replace(/\n\s*/g, '')
-    .replace(/>\s+</g, '><')
-    .replace(/\s{2,}/g, ' ');
-
-  fs.writeFileSync(path.join(DIST, htmlFile), html);
+function minifyHtml(html) {
+  return html.replace(/\n\s*/g, '').replace(/>\s+</g, '><').replace(/\s{2,}/g, ' ');
 }
 
-async function buildJs() {
-  const commonOptions = {
-    bundle: true,
-    minify: true,
-    target: ['chrome100'],
-    format: 'iife',
-  };
+/**
+ * Inlines a stylesheet into its page and writes the minified result.
+ *
+ * Asserts that the expected link was found and that no stylesheet links remain:
+ * a missed replacement would ship a page pointing at a file that is not in the
+ * bundle, which fails silently at runtime.
+ */
+function buildHtmlWithInlineCSS(htmlFile, cssFile) {
+  const htmlPath = path.join(SRC, htmlFile);
+  let html = fs.readFileSync(htmlPath, 'utf8');
+  const css = fs.readFileSync(path.join(SRC, cssFile), 'utf8');
 
-  await esbuild.build({
-    ...commonOptions,
-    entryPoints: [path.join(SRC, 'background.js')],
-    outfile: path.join(DIST, 'background.js'),
-  });
+  const linkRe = new RegExp(
+    `<link\\s+rel="stylesheet"\\s+href="${cssFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s*/?>`
+  );
+  if (!linkRe.test(html)) {
+    throw new Error(`${htmlFile}: expected <link rel="stylesheet" href="${cssFile}"> to inline`);
+  }
+  html = html.replace(linkRe, () => `<style>${css}</style>`);
 
-  await esbuild.build({
-    ...commonOptions,
-    entryPoints: [path.join(SRC, 'popup.js')],
-    outfile: path.join(DIST, 'popup.js'),
-  });
+  const leftover = html.match(/<link\s+rel="stylesheet"[^>]*>/);
+  if (leftover) {
+    throw new Error(
+      `${htmlFile}: still references an external stylesheet after inlining: ${leftover[0]}`
+    );
+  }
 
-  await esbuild.build({
-    ...commonOptions,
-    entryPoints: [path.join(SRC, 'offscreen.js')],
-    outfile: path.join(DIST, 'offscreen.js'),
-  });
-
-  await esbuild.build({
-    ...commonOptions,
-    entryPoints: [path.join(SRC, 'options.js')],
-    outfile: path.join(DIST, 'options.js'),
-  });
+  fs.writeFileSync(path.join(DIST, htmlFile), minifyHtml(html));
 }
 
 function buildOffscreenHtml() {
-  let html = fs.readFileSync(path.join(SRC, 'offscreen.html'), 'utf8');
-  html = html.replace(/\n\s*/g, '').replace(/>\s+</g, '><').replace(/\s{2,}/g, ' ');
-  fs.writeFileSync(path.join(DIST, 'offscreen.html'), html);
+  const html = fs.readFileSync(path.join(SRC, 'offscreen.html'), 'utf8');
+  fs.writeFileSync(path.join(DIST, 'offscreen.html'), minifyHtml(html));
+}
+
+async function buildJs() {
+  await esbuild.build({
+    entryPoints: [
+      path.join(SRC, 'background.js'),
+      path.join(SRC, 'popup.js'),
+      path.join(SRC, 'offscreen.js'),
+      path.join(SRC, 'options.js'),
+    ],
+    outdir: DIST,
+    bundle: true,
+    minify: true,
+    // Matches minimum_chrome_version in manifest.json (chrome.offscreen).
+    target: ['chrome109'],
+    format: 'iife',
+  });
 }
 
 async function build() {
@@ -93,34 +102,41 @@ async function build() {
   const start = Date.now();
 
   clean();
-  copyManifest();
+  buildManifest();
   copyIcons();
   buildHtmlWithInlineCSS('popup.html', 'popup.css');
   buildHtmlWithInlineCSS('options.html', 'options.css');
   buildOffscreenHtml();
   await buildJs();
 
-  const elapsed = Date.now() - start;
-  console.log(`Built in ${elapsed}ms → dist/`);
+  console.log(`Built in ${Date.now() - start}ms -> dist/`);
 }
 
 async function main() {
   await build();
 
-  if (watchMode) {
-    console.log('Watching for changes...');
-    const dirs = [SRC, __dirname];
-    const watchFiles = ['manifest.json'];
-
-    for (const dir of dirs) {
-      fs.watch(dir, { recursive: dir === SRC }, (event, filename) => {
-        if (!filename) return;
-        if (filename.includes('node_modules') || filename.includes('dist')) return;
-        console.log(`\nChanged: ${filename}`);
-        build().catch(console.error);
-      });
-    }
+  if (!watchMode) {
+    return;
   }
+
+  console.log('Watching for changes...');
+  fs.watch(SRC, { recursive: true }, (event, filename) => {
+    if (!filename || filename.includes('node_modules')) {
+      return;
+    }
+    console.log(`\nChanged: ${filename}`);
+    build().catch(console.error);
+  });
+
+  fs.watch(ROOT, (event, filename) => {
+    if (!filename || filename === 'dist' || filename.startsWith('.')) {
+      return;
+    }
+    if (filename.endsWith('.json') || filename.endsWith('.js')) {
+      console.log(`\nChanged: ${filename}`);
+      build().catch(console.error);
+    }
+  });
 }
 
 main().catch((err) => {

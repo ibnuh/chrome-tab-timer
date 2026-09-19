@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Node 20+ is enough for the tests; 24 keeps npm close to the version
+          # that wrote the committed lockfile.
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Package
+        run: cd dist && zip -r ../tab-timer.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tab-timer
+          path: |
+            tab-timer.zip
+            dist/
