@@ -7,7 +7,7 @@
   "scripts": {
     "build": "node build.js",
     "dev": "node build.js --watch",
-    "test": "node --test tests/",
+    "test": "node --test tests/*.test.js",
     "icons": "node generate-icons.js"
   },
   "devDependencies": {
