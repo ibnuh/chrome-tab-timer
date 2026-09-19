@@ -1,35 +1,98 @@
+import {
+  ACTION_DONE_LABELS,
+  HISTORY_KEY,
+  MAX_HISTORY,
+  SETTINGS_KEY,
+  TEMPLATES_KEY,
+  TITLE_PREFIX_RE,
+  URL_RULES_KEY,
+  computeStats,
+  formatDuration,
+  isValidPattern,
+  normalizeSettings,
+  normalizeStartRequest,
+  normalizeTabId,
+  normalizeTemplates,
+  normalizeUrlRules,
+  stripTitlePrefix,
+} from './lib.js';
+
 // Timer storage key prefix
 const TIMER_PREFIX = 'timer_';
 const BADGE_ALARM = 'badge_update';
-const MIN_ALARM_MS = 61000;
+
+// Chrome 120 honors alarms down to 30s; older versions clamp to 60s. Anything
+// shorter than this needs setTimeout for precision, but setTimeout lives in
+// worker memory and does not survive suspension, so short timers also get a
+// backstop alarm. On a pre-120 browser that alarm lands late rather than never.
+const MIN_ALARM_MS = 30000;
+const BADGE_PERIOD_MINUTES = 0.5;
 
 const shortTimers = new Map();
 
-// Storage keys
-const SETTINGS_KEY = 'settings';
-const HISTORY_KEY = 'history_log';
-const TEMPLATES_KEY = 'templates';
-const URL_RULES_KEY = 'url_rules';
-const MAX_HISTORY = 200;
+// Guards against two paths (setTimeout, backstop alarm, badge sweep) racing to
+// run the same completion twice.
+const firing = new Set();
+
+// --- Caches ---
+//
+// Settings and URL rules are read on hot paths (every tab title tick, every
+// navigation, every badge sweep). Both are invalidated by storage.onChanged.
+
+let settingsCache = null;
+let urlRulesCache = null;
+let presetSignature = '';
+
+function invalidateCaches(changes) {
+  if (!changes || changes[SETTINGS_KEY]) {
+    settingsCache = null;
+  }
+  if (!changes || changes[URL_RULES_KEY]) {
+    urlRulesCache = null;
+  }
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') {
+    return;
+  }
+  invalidateCaches(changes);
+
+  // Rebuild the preset submenu when the preset list actually changes, rather
+  // than leaving stale entries until the next browser start.
+  if (changes[SETTINGS_KEY]) {
+    const signature = normalizeSettings(changes[SETTINGS_KEY].newValue).presets.join(',');
+    if (signature !== presetSignature) {
+      presetSignature = signature;
+      rebuildContextMenus();
+    }
+  }
+});
 
 // --- Sound playback via offscreen document ---
 
 let creatingOffscreen = null;
 
 async function ensureOffscreen() {
-  const existing = await chrome.offscreen.hasDocument();
-  if (existing) return;
+  if (await chrome.offscreen.hasDocument()) {
+    return;
+  }
   if (creatingOffscreen) {
     await creatingOffscreen;
     return;
   }
-  creatingOffscreen = chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['AUDIO_PLAYBACK'],
-    justification: 'Play notification sound when a timer completes',
-  });
+  // Cleared in a finally: caching a rejected promise here would permanently
+  // disable sound for the life of the worker.
+  creatingOffscreen = chrome.offscreen
+    .createDocument({
+      url: 'offscreen.html',
+      reasons: ['AUDIO_PLAYBACK'],
+      justification: 'Play notification sound when a timer completes',
+    })
+    .finally(() => {
+      creatingOffscreen = null;
+    });
   await creatingOffscreen;
-  creatingOffscreen = null;
 }
 
 async function playSound() {
@@ -39,37 +102,45 @@ async function playSound() {
 
 // --- Settings ---
 
-const SETTINGS_DEFAULTS = {
-  sound: true,
-  notification: true,
-  tabTitle: true,
-  theme: 'system',
-  defaultAction: 'alert',
-  enabledActions: ['alert', 'close', 'reload', 'mute', 'focus'],
-  presets: [30, 60, 300, 600, 900, 1800],
-  snoozeMinutes: 5,
-  alertOnTabClose: false,
-};
-
 async function getSettings() {
+  if (settingsCache) {
+    return settingsCache;
+  }
   const result = await chrome.storage.local.get(SETTINGS_KEY);
-  return { ...SETTINGS_DEFAULTS, ...result[SETTINGS_KEY] };
+  settingsCache = normalizeSettings(result[SETTINGS_KEY]);
+  return settingsCache;
 }
 
 // --- History ---
 
-async function addHistoryEntry(timer, tabTitle) {
-  const result = await chrome.storage.local.get(HISTORY_KEY);
-  const entries = result[HISTORY_KEY] || [];
-  entries.unshift({
-    tabTitle,
-    label: timer.label || '',
-    action: timer.action,
-    completedAt: Date.now(),
-    duration: timer.endTime - (timer.startTime || timer.endTime),
+// History is a read-modify-write list, so concurrent updates have to be
+// serialized: two timers finishing at the same moment would otherwise both read
+// the same list and the second write would drop the first entry.
+let historyQueue = Promise.resolve();
+
+function withHistoryLock(fn) {
+  historyQueue = historyQueue.then(fn).catch((err) => {
+    console.warn('Tab Timer: history update failed', err);
   });
-  if (entries.length > MAX_HISTORY) entries.length = MAX_HISTORY;
-  await chrome.storage.local.set({ [HISTORY_KEY]: entries });
+  return historyQueue;
+}
+
+function addHistoryEntry(timer, tabTitle) {
+  return withHistoryLock(async () => {
+    const result = await chrome.storage.local.get(HISTORY_KEY);
+    const entries = result[HISTORY_KEY] || [];
+    entries.unshift({
+      tabTitle,
+      label: timer.label || '',
+      action: timer.action,
+      completedAt: Date.now(),
+      duration: timer.endTime - (timer.startTime || timer.endTime),
+    });
+    if (entries.length > MAX_HISTORY) {
+      entries.length = MAX_HISTORY;
+    }
+    await chrome.storage.local.set({ [HISTORY_KEY]: entries });
+  });
 }
 
 // --- Storage helpers ---
@@ -85,13 +156,14 @@ async function getAllTimers() {
   const timers = {};
   const staleKeys = [];
   for (const [key, value] of Object.entries(all)) {
-    if (key.startsWith(TIMER_PREFIX)) {
-      if (!value || !value.tabId || !Number.isFinite(value.endTime)) {
-        staleKeys.push(key);
-        continue;
-      }
-      timers[key] = value;
+    if (!key.startsWith(TIMER_PREFIX)) {
+      continue;
     }
+    if (!value || typeof value.tabId !== 'number' || !Number.isFinite(value.endTime)) {
+      staleKeys.push(key);
+      continue;
+    }
+    timers[key] = value;
   }
   if (staleKeys.length > 0) {
     await chrome.storage.local.remove(staleKeys);
@@ -100,50 +172,66 @@ async function getAllTimers() {
 }
 
 async function setTimer(tabId, data) {
-  const key = TIMER_PREFIX + tabId;
-  await chrome.storage.local.set({ [key]: data });
+  await chrome.storage.local.set({ [TIMER_PREFIX + tabId]: data });
 }
 
 async function removeTimer(tabId) {
-  const key = TIMER_PREFIX + tabId;
-  await chrome.storage.local.remove(key);
+  await chrome.storage.local.remove(TIMER_PREFIX + tabId);
   await chrome.alarms.clear(TIMER_PREFIX + tabId);
-  if (shortTimers.has(tabId)) {
-    clearTimeout(shortTimers.get(tabId));
-    shortTimers.delete(tabId);
-  }
+  clearShortTimer(tabId);
   await restoreTabTitle(tabId);
   await updateBadgeForTab(tabId);
+}
+
+function clearShortTimer(tabId) {
+  const handle = shortTimers.get(tabId);
+  if (handle) {
+    clearTimeout(handle);
+    shortTimers.delete(tabId);
+  }
 }
 
 // --- Templates ---
 
 async function getTemplates() {
   const result = await chrome.storage.local.get(TEMPLATES_KEY);
-  return result[TEMPLATES_KEY] || [];
+  return normalizeTemplates(result[TEMPLATES_KEY]);
 }
 
 async function saveTemplates(templates) {
-  await chrome.storage.local.set({ [TEMPLATES_KEY]: templates });
+  await chrome.storage.local.set({ [TEMPLATES_KEY]: normalizeTemplates(templates) });
 }
 
 // --- URL Rules ---
 
 async function getUrlRules() {
+  if (urlRulesCache) {
+    return urlRulesCache;
+  }
   const result = await chrome.storage.local.get(URL_RULES_KEY);
-  return result[URL_RULES_KEY] || [];
+  urlRulesCache = normalizeUrlRules(result[URL_RULES_KEY]);
+  return urlRulesCache;
 }
 
 async function saveUrlRules(rules) {
-  await chrome.storage.local.set({ [URL_RULES_KEY]: rules });
+  const normalized = normalizeUrlRules(rules);
+  urlRulesCache = normalized;
+  await chrome.storage.local.set({ [URL_RULES_KEY]: normalized });
+  return normalized;
 }
 
 // --- Shared timer start helper ---
 
 async function startTimerForTab(tabId, duration, action, label) {
   const now = Date.now();
-  const endTime = now + duration;
-  const timerData = { tabId, startTime: now, endTime, action: action || 'alert', label: label || '', paused: false };
+  const timerData = {
+    tabId,
+    startTime: now,
+    endTime: now + duration,
+    action: action || 'alert',
+    label: label || '',
+    paused: false,
+  };
   await setTimer(tabId, timerData);
   createTimerAlarm(tabId, duration);
   await ensureBadgeAlarm();
@@ -154,28 +242,36 @@ async function startTimerForTab(tabId, duration, action, label) {
 // --- Alarm management ---
 
 function createTimerAlarm(tabId, delayMs) {
-  if (shortTimers.has(tabId)) {
-    clearTimeout(shortTimers.get(tabId));
-    shortTimers.delete(tabId);
-  }
+  clearShortTimer(tabId);
 
-  if (delayMs < MIN_ALARM_MS) {
+  // Inclusive: at exactly the floor the alarm is only exact on Chrome 120+, so
+  // a timer at the boundary gets the precise path too.
+  if (delayMs <= MIN_ALARM_MS) {
     const handle = setTimeout(() => {
       shortTimers.delete(tabId);
       onTimerFired(tabId);
     }, delayMs);
     shortTimers.set(tabId, handle);
-  } else {
-    chrome.alarms.create(TIMER_PREFIX + tabId, { delayInMinutes: delayMs / 60000 });
   }
+
+  // Always arm the alarm, even when setTimeout is doing the precise work. It
+  // outlives worker suspension, and onTimerFired is idempotent, so an early
+  // setTimeout firing simply wins and the later alarm becomes a no-op.
+  const alarmDelayMs = Math.max(delayMs, MIN_ALARM_MS);
+  chrome.alarms.create(TIMER_PREFIX + tabId, { delayInMinutes: alarmDelayMs / 60000 });
 }
 
 // --- Badge ---
 
 async function updateBadgeForTab(tabId) {
+  // Without this a missing tab id reaches setBadgeText as an explicitly
+  // undefined tabId, which Chrome reads as "no tab" and applies globally.
+  if (!Number.isInteger(tabId)) {
+    return;
+  }
   const timer = await getTimer(tabId);
   if (!timer || timer.paused) {
-    try { await chrome.action.setBadgeText({ tabId, text: '' }); } catch {}
+    await setBadge(tabId, '');
     return;
   }
 
@@ -193,60 +289,92 @@ async function updateBadgeForTab(tabId) {
     text = totalSec + 's';
   }
 
+  await setBadge(tabId, text);
+}
+
+async function setBadge(tabId, text) {
   try {
     await chrome.action.setBadgeText({ tabId, text });
-    await chrome.action.setBadgeBackgroundColor({ tabId, color: '#2563eb' });
-  } catch {}
+  } catch {
+    // Tab went away mid-update; the orphan sweep will clean up behind us.
+  }
+}
+
+async function applyBadgeStyle() {
+  try {
+    await chrome.action.setBadgeBackgroundColor({ color: '#2563eb' });
+  } catch {
+    // Non-fatal: the badge text still renders with the default colour.
+  }
 }
 
 async function updateAllBadges() {
   const timers = await getAllTimers();
-  const timerTabIds = new Set();
-
-  const openTabs = await chrome.tabs.query({});
-  const openTabIds = new Set(openTabs.map((t) => t.id));
-
-  for (const [, timer] of Object.entries(timers)) {
-    if (!openTabIds.has(timer.tabId)) {
-      await removeTimer(timer.tabId);
-      continue;
-    }
-    timerTabIds.add(timer.tabId);
+  for (const timer of Object.values(timers)) {
     await updateBadgeForTab(timer.tabId);
   }
-
-  if (timerTabIds.size > 0) {
+  if (Object.keys(timers).length > 0) {
     await ensureBadgeAlarm();
   } else {
     await chrome.alarms.clear(BADGE_ALARM);
   }
 }
 
+/**
+ * Safety net for anything the alarm and setTimeout paths missed: drops timers
+ * whose tab is gone, fires timers whose deadline already passed, refreshes
+ * badges. Runs on the badge alarm and on startup.
+ */
+async function reconcileTimers() {
+  const timers = await getAllTimers();
+  const openTabIds = new Set((await chrome.tabs.query({})).map((t) => t.id));
+
+  for (const timer of Object.values(timers)) {
+    if (!openTabIds.has(timer.tabId)) {
+      await removeTimer(timer.tabId);
+    } else if (!timer.paused && timer.endTime <= Date.now()) {
+      await onTimerFired(timer.tabId);
+    }
+  }
+
+  await updateAllBadges();
+}
+
+async function ensureBadgeAlarm() {
+  const existing = await chrome.alarms.get(BADGE_ALARM);
+  if (!existing) {
+    chrome.alarms.create(BADGE_ALARM, { periodInMinutes: BADGE_PERIOD_MINUTES });
+  }
+}
+
 // --- Tab title ---
 
-const TITLE_PREFIX_RE = /^\d+[hms]\d*[ms]? \| /;
-
+/**
+ * Injects (or refreshes) the in-page countdown ticker.
+ *
+ * The injected function is serialized by chrome.scripting, so it cannot call
+ * into lib.js; formatSec mirrors formatCountdown there, and the
+ * titlePrefixRoundTrip test pins the contract for both.
+ */
 async function updateTabTitle(tabId) {
-  const cfg = await getSettings();
-  if (!cfg.tabTitle) return;
-  const timer = await getTimer(tabId);
-  if (!timer) return;
+  const [cfg, timer] = await Promise.all([getSettings(), getTimer(tabId)]);
 
-  const endTime = timer.paused ? null : timer.endTime;
-  const pausedRemaining = timer.paused ? timer.remaining : null;
+  if (!timer || !cfg.tabTitle) {
+    await restoreTabTitle(tabId);
+    return;
+  }
+
+  const base = stripTitlePrefix(await getTabTitle(tabId));
 
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (endTime, pausedRemaining, prefixRe) => {
+      func: (endTime, pausedRemaining, prefixRe, initialBase) => {
         const re = new RegExp(prefixRe);
-        if (!window.__tabTimerOrigTitle) {
-          window.__tabTimerOrigTitle = document.title.replace(re, '');
-        }
-        if (window.__tabTimerInterval) {
-          clearInterval(window.__tabTimerInterval);
-          window.__tabTimerInterval = null;
-        }
+        let original = initialBase;
+        // What this ticker last wrote, so a page rewriting its own title is
+        // detected rather than clobbered on the next tick.
+        let lastApplied = null;
 
         function formatSec(totalSec) {
           if (totalSec <= 0) return '0s';
@@ -259,100 +387,124 @@ async function updateTabTitle(tabId) {
           return s + 's';
         }
 
-        function tick() {
-          let remaining;
-          if (endTime) {
-            remaining = Math.max(0, endTime - Date.now());
-          } else {
-            remaining = pausedRemaining || 0;
-          }
-          const totalSec = Math.ceil(remaining / 1000);
-          if (totalSec <= 0) {
-            document.title = window.__tabTimerOrigTitle;
-            if (window.__tabTimerInterval) clearInterval(window.__tabTimerInterval);
+        function stop() {
+          if (window.__tabTimerInterval) {
+            clearInterval(window.__tabTimerInterval);
             window.__tabTimerInterval = null;
-            window.__tabTimerOrigTitle = null;
-            return;
           }
-          const prefix = formatSec(totalSec) + ' | ';
-          document.title = prefix + window.__tabTimerOrigTitle;
         }
 
+        function tick() {
+          const current = document.title;
+          if (lastApplied !== null && current !== lastApplied) {
+            original = current.replace(re, '');
+          }
+          window.__tabTimerOrigTitle = original;
+
+          const remaining = endTime ? Math.max(0, endTime - Date.now()) : pausedRemaining || 0;
+          const totalSec = Math.ceil(remaining / 1000);
+          if (totalSec <= 0) {
+            stop();
+            window.__tabTimerOrigTitle = null;
+            document.title = original;
+            return;
+          }
+          lastApplied = formatSec(totalSec) + ' | ' + original;
+          document.title = lastApplied;
+        }
+
+        stop();
         tick();
         if (endTime) {
           window.__tabTimerInterval = setInterval(tick, 1000);
         }
       },
-      args: [endTime, pausedRemaining, TITLE_PREFIX_RE.source],
+      args: [timer.paused ? null : timer.endTime, timer.paused ? timer.remaining : null, TITLE_PREFIX_RE.source, base],
     });
-  } catch {}
+  } catch {
+    // Restricted pages (chrome://, the Web Store) reject injection. The timer
+    // itself is unaffected, only the title countdown is skipped.
+  }
 }
 
 async function restoreTabTitle(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => {
+      func: (prefixRe) => {
         if (window.__tabTimerInterval) {
           clearInterval(window.__tabTimerInterval);
           window.__tabTimerInterval = null;
         }
-        if (window.__tabTimerOrigTitle) {
-          document.title = window.__tabTimerOrigTitle;
-          window.__tabTimerOrigTitle = null;
-        }
+        const original = window.__tabTimerOrigTitle;
+        window.__tabTimerOrigTitle = null;
+        document.title = original || document.title.replace(new RegExp(prefixRe), '');
       },
+      args: [TITLE_PREFIX_RE.source],
     });
-  } catch {}
+  } catch {
+    // Nothing to restore when the page is gone or injection is disallowed.
+  }
 }
 
-
-async function ensureBadgeAlarm() {
-  const existing = await chrome.alarms.get(BADGE_ALARM);
-  if (!existing) {
-    chrome.alarms.create(BADGE_ALARM, { periodInMinutes: 1/6 });
+async function getTabTitle(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return tab.title || 'Unknown tab';
+  } catch {
+    return 'Unknown tab';
   }
 }
 
 // --- Timer fired handler ---
 
 async function onTimerFired(tabId) {
-  const timer = await getTimer(tabId);
-  if (!timer) return;
-
-  await executeAction(timer);
-  await removeTimer(tabId);
-  await updateAllBadges();
+  if (firing.has(tabId)) {
+    return;
+  }
+  // Claimed before the first await: checking and setting across an await is not
+  // atomic, and the alarm, the setTimeout, and the 30s sweep can all arrive at
+  // the same expired timer.
+  firing.add(tabId);
+  try {
+    const timer = await getTimer(tabId);
+    if (!timer) {
+      return;
+    }
+    // Storage is cleared before the action runs. Closing the tab first would
+    // let tabs.onRemoved see a live timer and report a cancellation for a timer
+    // that actually completed.
+    await removeTimer(tabId);
+    await executeAction(timer);
+    await updateAllBadges();
+  } finally {
+    firing.delete(tabId);
+  }
 }
 
 // --- Actions on timer completion ---
 
-const ACTION_LABELS = {
-  alert: 'Alert',
-  close: 'Tab closed',
-  reload: 'Tab reloaded',
-  mute: 'Tab muted',
-  focus: 'Tab focused',
-};
-
 async function executeAction(timer) {
   const { tabId, action, label } = timer;
-  const tabTitle = await getTabTitle(tabId);
-  const cfg = await getSettings();
+  const [tabTitle, cfg] = await Promise.all([getTabTitle(tabId), getSettings()]);
 
   await addHistoryEntry(timer, tabTitle);
 
   const durationStr = formatDuration(timer.endTime - (timer.startTime || timer.endTime));
   const title = label ? `Timer: ${label}` : 'Tab Timer';
-  const actionDesc = ACTION_LABELS[action] || 'Alert';
+  const actionDesc = ACTION_DONE_LABELS[action] || ACTION_DONE_LABELS.alert;
   const message = `${durationStr} timer completed\n${tabTitle}\nAction: ${actionDesc}`;
 
   if (cfg.sound) {
-    try { await playSound(); } catch (e) { console.warn('Could not play sound', e); }
+    try {
+      await playSound();
+    } catch (e) {
+      console.warn('Tab Timer: could not play sound', e);
+    }
   }
 
   if (cfg.notification) {
-    chrome.notifications.create('timer_done_' + tabId, {
+    chrome.notifications.create(`timer_done_${tabId}`, {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
       title,
@@ -385,26 +537,7 @@ async function executeAction(timer) {
         break;
     }
   } catch (e) {
-    console.warn('Action failed for tab', tabId, e);
-  }
-}
-
-function formatDuration(ms) {
-  const totalSec = Math.round(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-async function getTabTitle(tabId) {
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    return (tab.title || 'Unknown tab').replace(TITLE_PREFIX_RE, '');
-  } catch {
-    return 'Unknown tab';
+    console.warn('Tab Timer: action failed for tab', tabId, e);
   }
 }
 
@@ -412,144 +545,155 @@ async function getTabTitle(tabId) {
 
 async function snoozeTimer(tabId) {
   const cfg = await getSettings();
-  const duration = cfg.snoozeMinutes * 60 * 1000;
-  await startTimerForTab(tabId, duration, 'alert', `Snoozed (${cfg.snoozeMinutes}m)`);
+  await startTimerForTab(tabId, cfg.snoozeMinutes * 60 * 1000, 'alert', `Snoozed (${cfg.snoozeMinutes}m)`);
 }
 
 // --- Context menu ---
 
-function buildContextMenus() {
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: 'tabtimer-parent',
-      title: 'Tab Timer',
+const PRESET_LABELS = {
+  30: '30s',
+  60: '1m',
+  300: '5m',
+  600: '10m',
+  900: '15m',
+  1800: '30m',
+  3600: '1h',
+};
+
+/**
+ * contextMenus.create reports failures through runtime.lastError rather than by
+ * throwing, so reading it in the callback is the only way a duplicate id becomes
+ * visible instead of silently dropping a menu item.
+ */
+function createMenuItem(options) {
+  chrome.contextMenus.create(options, () => {
+    if (chrome.runtime.lastError) {
+      console.warn('Tab Timer: context menu item failed', options.id, chrome.runtime.lastError.message);
+    }
+  });
+}
+
+// Serialized: a rebuild is removeAll-then-create, so two overlapping rebuilds
+// could interleave and leave the menu half-populated.
+let menuQueue = Promise.resolve();
+
+function rebuildContextMenus() {
+  menuQueue = menuQueue.then(buildContextMenus).catch((err) => {
+    console.warn('Tab Timer: could not rebuild context menus', err);
+  });
+  return menuQueue;
+}
+
+async function buildContextMenus() {
+  await chrome.contextMenus.removeAll();
+  const cfg = await getSettings();
+  presetSignature = cfg.presets.join(',');
+
+  createMenuItem({
+    id: 'tabtimer-parent',
+    title: 'Tab Timer',
+    contexts: ['page'],
+  });
+
+  for (const secs of cfg.presets) {
+    createMenuItem({
+      id: `tabtimer-preset-${secs}`,
+      parentId: 'tabtimer-parent',
+      title: `Set ${PRESET_LABELS[secs] || formatDuration(secs * 1000)} timer`,
       contexts: ['page'],
     });
+  }
 
-    const presetLabels = {
-      30: '30s', 60: '1m', 300: '5m', 600: '10m', 900: '15m', 1800: '30m', 3600: '1h',
-    };
+  createMenuItem({
+    id: 'tabtimer-sep1',
+    parentId: 'tabtimer-parent',
+    type: 'separator',
+    contexts: ['page'],
+  });
 
-    // We'll add presets dynamically from settings
-    getSettings().then((cfg) => {
-      for (const secs of cfg.presets) {
-        const label = presetLabels[secs] || formatDuration(secs * 1000);
-        chrome.contextMenus.create({
-          id: `tabtimer-preset-${secs}`,
-          parentId: 'tabtimer-parent',
-          title: `Set ${label} timer`,
-          contexts: ['page'],
-        });
-      }
+  createMenuItem({
+    id: 'tabtimer-cancel',
+    parentId: 'tabtimer-parent',
+    title: 'Cancel timer on this tab',
+    contexts: ['page'],
+  });
 
-      chrome.contextMenus.create({
-        id: 'tabtimer-sep1',
-        parentId: 'tabtimer-parent',
-        type: 'separator',
-        contexts: ['page'],
-      });
-
-      chrome.contextMenus.create({
-        id: 'tabtimer-cancel',
-        parentId: 'tabtimer-parent',
-        title: 'Cancel timer on this tab',
-        contexts: ['page'],
-      });
-
-      chrome.contextMenus.create({
-        id: 'tabtimer-cancel-all',
-        parentId: 'tabtimer-parent',
-        title: 'Cancel all timers',
-        contexts: ['page'],
-      });
-    });
+  chrome.contextMenus.create({
+    id: 'tabtimer-cancel-all',
+    parentId: 'tabtimer-parent',
+    title: 'Cancel all timers',
+    contexts: ['page'],
   });
 }
 
 // --- URL-based auto timers ---
 
 async function checkUrlRules(tabId, url) {
-  if (!url) return;
+  if (!url) {
+    return;
+  }
   const rules = await getUrlRules();
-  if (rules.length === 0) return;
+  if (rules.length === 0) {
+    return;
+  }
 
   // Don't auto-set if tab already has a timer
-  const existing = await getTimer(tabId);
-  if (existing) return;
+  if (await getTimer(tabId)) {
+    return;
+  }
 
   for (const rule of rules) {
-    if (!rule.enabled || !rule.pattern) continue;
-    try {
-      const re = new RegExp(rule.pattern, 'i');
-      if (re.test(url)) {
-        await startTimerForTab(tabId, rule.duration * 1000, rule.action || 'alert', rule.label || `Auto: ${rule.pattern}`);
-        return;
-      }
-    } catch {}
+    if (!rule.enabled || !isValidPattern(rule.pattern)) {
+      continue;
+    }
+    if (new RegExp(rule.pattern, 'i').test(url)) {
+      await startTimerForTab(tabId, rule.duration * 1000, rule.action, rule.label || `Auto: ${rule.pattern}`);
+      return;
+    }
   }
-}
-
-// --- Stats ---
-
-function computeStats(history) {
-  if (!history || history.length === 0) {
-    return { total: 0, totalDuration: 0, avgDuration: 0, byAction: {}, byDay: {} };
-  }
-
-  let totalDuration = 0;
-  const byAction = {};
-  const byDay = {};
-
-  for (const entry of history) {
-    totalDuration += entry.duration || 0;
-    byAction[entry.action] = (byAction[entry.action] || 0) + 1;
-
-    const day = new Date(entry.completedAt).toISOString().slice(0, 10);
-    byDay[day] = (byDay[day] || 0) + 1;
-  }
-
-  return {
-    total: history.length,
-    totalDuration,
-    avgDuration: Math.round(totalDuration / history.length),
-    byAction,
-    byDay,
-  };
 }
 
 // --- Event listeners ---
 
-// Alarm fired
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === BADGE_ALARM) {
-    await updateAllBadges();
+    await reconcileTimers();
     return;
   }
 
-  if (!alarm.name.startsWith(TIMER_PREFIX)) return;
+  if (!alarm.name.startsWith(TIMER_PREFIX)) {
+    return;
+  }
 
-  const tabId = parseInt(alarm.name.slice(TIMER_PREFIX.length), 10);
-  await onTimerFired(tabId);
+  await onTimerFired(parseInt(alarm.name.slice(TIMER_PREFIX.length), 10));
 });
 
 // Notification clicked - focus the tab
 chrome.notifications.onClicked.addListener(async (notificationId) => {
-  if (!notificationId.startsWith('timer_done_')) return;
+  if (!notificationId.startsWith('timer_done_')) {
+    return;
+  }
   const tabId = parseInt(notificationId.slice('timer_done_'.length), 10);
   try {
     const tab = await chrome.tabs.get(tabId);
     await chrome.windows.update(tab.windowId, { focused: true });
     await chrome.tabs.update(tabId, { active: true });
-  } catch {}
+  } catch {
+    // Tab already closed.
+  }
   chrome.notifications.clear(notificationId);
 });
 
 // Notification button clicked - snooze
 chrome.notifications.onButtonClicked.addListener(async (notificationId, buttonIndex) => {
-  if (!notificationId.startsWith('timer_done_')) return;
+  if (!notificationId.startsWith('timer_done_')) {
+    return;
+  }
   if (buttonIndex === 0) {
     const tabId = parseInt(notificationId.slice('timer_done_'.length), 10);
-    await snoozeTimer(tabId);
+    if (await getTimer(tabId)) {
+      await snoozeTimer(tabId);
+    }
   }
   chrome.notifications.clear(notificationId);
 });
@@ -557,23 +701,25 @@ chrome.notifications.onButtonClicked.addListener(async (notificationId, buttonIn
 // Tab closed - clean up
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   const timer = await getTimer(tabId);
-  if (timer) {
-    // Alert if setting is enabled
-    const cfg = await getSettings();
-    if (cfg.alertOnTabClose) {
-      const durationStr = formatDuration(timer.endTime - (timer.startTime || timer.endTime));
-      const label = timer.label ? ` (${timer.label})` : '';
-      chrome.notifications.create('tab_closed_' + tabId, {
-        type: 'basic',
-        iconUrl: 'icons/icon128.png',
-        title: 'Timer cancelled - tab closed',
-        message: `${durationStr} timer${label} was cancelled because the tab was closed.`,
-        priority: 1,
-      });
-    }
-    await removeTimer(tabId);
-    await updateAllBadges();
+  if (!timer) {
+    return;
   }
+  // Reached only when the user closed the tab themselves: onTimerFired clears
+  // storage before running a close action.
+  const cfg = await getSettings();
+  if (cfg.alertOnTabClose) {
+    const durationStr = formatDuration(timer.endTime - (timer.startTime || timer.endTime));
+    const label = timer.label ? ` (${timer.label})` : '';
+    chrome.notifications.create(`tab_closed_${tabId}`, {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'Timer cancelled - tab closed',
+      message: `${durationStr} timer${label} was cancelled because the tab was closed.`,
+      priority: 1,
+    });
+  }
+  await removeTimer(tabId);
+  await updateAllBadges();
 });
 
 // Tab activated - update badge
@@ -581,93 +727,113 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   await updateBadgeForTab(tabId);
 });
 
-// Tab URL changed - check URL rules
+// Tab URL changed - check URL rules, and re-arm the title countdown
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.url) {
     await checkUrlRules(tabId, changeInfo.url);
   }
-  // Re-inject tab title after page load (survives reload/navigation)
-  if (changeInfo.status === 'complete') {
-    const timer = await getTimer(tabId);
-    if (timer) {
-      await updateTabTitle(tabId);
-    }
+  // Re-inject after page load so the countdown survives reload/navigation.
+  if (changeInfo.status === 'complete' && (await getTimer(tabId))) {
+    await updateTabTitle(tabId);
   }
 });
 
 // Context menu clicked
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (!tab) return;
+  if (!tab) {
+    return;
+  }
 
   if (info.menuItemId === 'tabtimer-cancel') {
     await removeTimer(tab.id);
     await updateAllBadges();
   } else if (info.menuItemId === 'tabtimer-cancel-all') {
-    const timers = await getAllTimers();
-    for (const [, timer] of Object.entries(timers)) {
-      await removeTimer(timer.tabId);
-    }
-    await updateAllBadges();
-  } else if (info.menuItemId.startsWith('tabtimer-preset-')) {
-    const secs = parseInt(info.menuItemId.slice('tabtimer-preset-'.length), 10);
+    await cancelAllTimers();
+  } else if (String(info.menuItemId).startsWith('tabtimer-preset-')) {
+    const secs = parseInt(String(info.menuItemId).slice('tabtimer-preset-'.length), 10);
     const cfg = await getSettings();
-    await startTimerForTab(tab.id, secs * 1000, cfg.defaultAction, '');
+    if (Number.isFinite(secs) && secs > 0) {
+      await startTimerForTab(tab.id, secs * 1000, cfg.defaultAction, '');
+    }
   }
 });
 
 // Keyboard shortcut
 chrome.commands.onCommand.addListener(async (command) => {
-  if (command === 'quick-timer') {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab) return;
-    const cfg = await getSettings();
-    const defaultPreset = cfg.presets[0] || 60;
-    await startTimerForTab(tab.id, defaultPreset * 1000, cfg.defaultAction, '');
+  if (command !== 'quick-timer') {
+    return;
   }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) {
+    return;
+  }
+  const cfg = await getSettings();
+  await startTimerForTab(tab.id, (cfg.presets[0] || 60) * 1000, cfg.defaultAction, '');
 });
+
+// --- Shared operations used by menus and messages ---
+
+async function cancelAllTimers() {
+  const timers = await getAllTimers();
+  for (const timer of Object.values(timers)) {
+    await removeTimer(timer.tabId);
+  }
+  await updateAllBadges();
+  return Object.keys(timers).length;
+}
 
 // --- Message handling from popup/options ---
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  handleMessage(msg).then(sendResponse);
+  handleMessage(msg)
+    .then(sendResponse)
+    .catch((err) => {
+      // Without this the port closes with no response and the popup's await
+      // rejects with a confusing "message port closed" error.
+      console.error('Tab Timer: message failed', msg?.type, err);
+      sendResponse({ error: err instanceof Error ? err.message : String(err) });
+    });
   return true;
 });
 
 async function handleMessage(msg) {
+  if (!msg || typeof msg.type !== 'string') {
+    return { error: 'malformed message' };
+  }
+
   switch (msg.type) {
     case 'START_TIMER': {
-      const { tabId, duration, action, label } = msg;
-      await startTimerForTab(tabId, duration, action, label);
+      const req = normalizeStartRequest(msg);
+      if (!req || req.tabId === null) {
+        return { error: 'invalid timer request' };
+      }
+      await startTimerForTab(req.tabId, req.duration, req.action, req.label);
       return { success: true };
     }
 
     case 'CANCEL_TIMER': {
-      await removeTimer(msg.tabId);
+      const tabId = normalizeTabId(msg.tabId);
+      if (tabId === null) {
+        return { error: 'invalid tab id' };
+      }
+      await removeTimer(tabId);
       await updateAllBadges();
       return { success: true };
     }
 
-    case 'CANCEL_ALL_TIMERS': {
-      const timers = await getAllTimers();
-      for (const [, timer] of Object.entries(timers)) {
-        await removeTimer(timer.tabId);
-      }
-      await updateAllBadges();
-      return { success: true };
-    }
+    case 'CANCEL_ALL_TIMERS':
+      return { success: true, count: await cancelAllTimers() };
 
     case 'PAUSE_TIMER': {
       const timer = await getTimer(msg.tabId);
-      if (!timer || timer.paused) return { success: false };
-      const remaining = timer.endTime - Date.now();
+      if (!timer || timer.paused) {
+        return { error: 'no running timer' };
+      }
       timer.paused = true;
-      timer.remaining = remaining;
+      timer.remaining = Math.max(0, timer.endTime - Date.now());
       await setTimer(msg.tabId, timer);
       await chrome.alarms.clear(TIMER_PREFIX + msg.tabId);
-      if (shortTimers.has(msg.tabId)) {
-        clearTimeout(shortTimers.get(msg.tabId));
-        shortTimers.delete(msg.tabId);
-      }
+      clearShortTimer(msg.tabId);
       await updateBadgeForTab(msg.tabId);
       await updateTabTitle(msg.tabId);
       return { success: true };
@@ -675,8 +841,10 @@ async function handleMessage(msg) {
 
     case 'RESUME_TIMER': {
       const timer = await getTimer(msg.tabId);
-      if (!timer || !timer.paused) return { success: false };
-      const remaining = timer.remaining;
+      if (!timer || !timer.paused) {
+        return { error: 'no paused timer' };
+      }
+      const remaining = Math.max(0, timer.remaining || 0);
       timer.paused = false;
       timer.endTime = Date.now() + remaining;
       delete timer.remaining;
@@ -700,7 +868,9 @@ async function handleMessage(msg) {
     }
 
     case 'CLEAR_HISTORY':
-      await chrome.storage.local.remove(HISTORY_KEY);
+      // Through the same lock, so a completion landing at the same moment
+      // cannot resurrect the entries this is clearing.
+      await withHistoryLock(() => chrome.storage.local.remove(HISTORY_KEY));
       return { success: true };
 
     case 'GET_SETTINGS':
@@ -711,55 +881,88 @@ async function handleMessage(msg) {
       return { stats: computeStats(result[HISTORY_KEY] || []) };
     }
 
-    // Templates
     case 'GET_TEMPLATES':
       return { templates: await getTemplates() };
 
-    case 'SAVE_TEMPLATES':
-      await saveTemplates(msg.templates);
-      return { success: true };
+    case 'SAVE_TEMPLATES': {
+      const templates = await saveTemplates(msg.templates);
+      return { success: true, count: templates.length };
+    }
 
-    // URL rules
     case 'GET_URL_RULES':
       return { rules: await getUrlRules() };
 
-    case 'SAVE_URL_RULES':
-      await saveUrlRules(msg.rules);
-      return { success: true };
+    case 'SAVE_URL_RULES': {
+      const rules = await saveUrlRules(msg.rules);
+      return { success: true, count: rules.length };
+    }
 
-    // Snooze
     case 'SNOOZE_TIMER':
+      if (!(await getTimer(msg.tabId))) {
+        return { error: 'no timer to snooze' };
+      }
       await snoozeTimer(msg.tabId);
       return { success: true };
 
-    // Tab group
     case 'START_TIMER_FOR_GROUP': {
-      const { groupId, duration, action, label } = msg;
-      const tabs = await chrome.tabs.query({ groupId });
+      const req = normalizeStartRequest(msg);
+      if (!req || !Number.isInteger(msg.groupId) || msg.groupId < 0) {
+        return { error: 'invalid group timer request' };
+      }
+      const tabs = await chrome.tabs.query({ groupId: msg.groupId });
       for (const tab of tabs) {
-        await startTimerForTab(tab.id, duration, action, label);
+        await startTimerForTab(tab.id, req.duration, req.action, req.label);
       }
       return { success: true, count: tabs.length };
     }
 
-    // Export/import
+    case 'PLAY_SOUND': {
+      // Sent by playSound() and consumed by the offscreen document.
+      return { success: true };
+    }
+
     case 'EXPORT_DATA': {
-      const allData = await chrome.storage.local.get(null);
-      const exportData = {
-        settings: allData[SETTINGS_KEY] || {},
-        templates: allData[TEMPLATES_KEY] || [],
-        urlRules: allData[URL_RULES_KEY] || [],
+      const all = await chrome.storage.local.get(null);
+      return {
+        data: {
+          settings: all[SETTINGS_KEY] || {},
+          templates: all[TEMPLATES_KEY] || [],
+          urlRules: all[URL_RULES_KEY] || [],
+        },
       };
-      return { data: exportData };
     }
 
     case 'IMPORT_DATA': {
-      const { data } = msg;
-      if (data.settings) await chrome.storage.local.set({ [SETTINGS_KEY]: data.settings });
-      if (data.templates) await chrome.storage.local.set({ [TEMPLATES_KEY]: data.templates });
-      if (data.urlRules) await chrome.storage.local.set({ [URL_RULES_KEY]: data.urlRules });
-      buildContextMenus();
-      return { success: true };
+      const data = msg.data;
+      if (!data || typeof data !== 'object') {
+        return { error: 'malformed import file' };
+      }
+
+      // Only keys actually present are written, so importing a partial file
+      // does not silently reset everything it omits.
+      const updates = {};
+      const dropped = {};
+      if (data.settings !== undefined) {
+        updates[SETTINGS_KEY] = normalizeSettings(data.settings);
+      }
+      if (data.templates !== undefined) {
+        const templates = normalizeTemplates(data.templates);
+        updates[TEMPLATES_KEY] = templates;
+        dropped.templates = (Array.isArray(data.templates) ? data.templates.length : 0) - templates.length;
+      }
+      if (data.urlRules !== undefined) {
+        const rules = normalizeUrlRules(data.urlRules);
+        updates[URL_RULES_KEY] = rules;
+        dropped.urlRules = (Array.isArray(data.urlRules) ? data.urlRules.length : 0) - rules.length;
+      }
+      if (Object.keys(updates).length === 0) {
+        return { error: 'nothing to import' };
+      }
+
+      await chrome.storage.local.set(updates);
+      invalidateCaches(null);
+      await rebuildContextMenus();
+      return { success: true, dropped };
     }
 
     default:
@@ -770,23 +973,15 @@ async function handleMessage(msg) {
 // On install/update
 chrome.runtime.onInstalled.addListener(async () => {
   await getAllTimers();
-  await updateAllBadges();
-  buildContextMenus();
+  await applyBadgeStyle();
+  await rebuildContextMenus();
+  await reconcileTimers();
 });
 
 // On startup
 chrome.runtime.onStartup.addListener(async () => {
-  const timers = await getAllTimers();
-  for (const [, timer] of Object.entries(timers)) {
-    if (timer.paused) continue;
-    const remaining = timer.endTime - Date.now();
-    if (remaining <= 0) {
-      await executeAction(timer, false);
-      await removeTimer(timer.tabId);
-    } else {
-      createTimerAlarm(timer.tabId, remaining);
-    }
-  }
-  await updateAllBadges();
-  buildContextMenus();
+  // Badge text and colour are session state, so re-apply after a browser start.
+  await applyBadgeStyle();
+  await rebuildContextMenus();
+  await reconcileTimers();
 });
