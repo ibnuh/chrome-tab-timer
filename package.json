@@ -1,6 +1,6 @@
 {
   "name": "chrome-tab-timer",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Lightweight Chrome extension for per-tab timers with configurable completion actions",
   "private": true,
   "type": "module",
